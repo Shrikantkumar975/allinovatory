@@ -1,36 +1,203 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Allo Inventory — Reservation System
 
-## Getting Started
+## What is this?
+Allo is building an inventory management platform for 
+retailers with multi-warehouse and D2C brands.
 
-First, run the development server:
+## The Problem
+When a customer proceeds to checkout, they may take 
+5-10 minutes to complete the payment (UPI, 3DS flows, 
+wallet redirects). During this window, many other 
+customers are viewing the same product, adding it to 
+their cart and proceeding to checkout. At the very end 
+they face "Out of Stock" — which is a very bad experience.
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+### Two naive solutions and why they fail:
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+**1. Decrement stock only at payment time**
+Two customers can complete payment for the same unit 
+simultaneously. This causes oversell — one gets a refund, 
+the other a bad experience, and the operations team has 
+to manually clean up the mess.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+**2. Decrement stock at add-to-cart time**
+80% of carts are abandoned. The inventory is physically 
+available but looks depleted to other shoppers. 
+Conversion rate drops significantly.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## The Solution — Reservation System
+When a user proceeds to checkout, we create a temporary 
+reservation with a 10 minute expiry window. Three 
+scenarios can happen:
 
-## Learn More
+1. User confirms payment → 
+   totalUnits - 1, reservedUnits - 1 (permanent deduction)
+   
+2. User cancels → 
+   reservedUnits - 1 (unit instantly back to available)
+   
+3. Timer expires → 
+   reservedUnits - 1 (auto released by background job)
 
-To learn more about Next.js, take a look at the following resources:
+### Why totalUnits never changes until confirmation?
+To protect against false inventory depletion. If we 
+modified totalUnits on every reserve/cancel cycle, one 
+bug in the system could permanently corrupt the inventory 
+count. totalUnits only changes when money actually 
+exchanges hands.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+### Available stock is always:
+availableUnits = totalUnits - reservedUnits
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Concurrency Approach
 
-## Deploy on Vercel
+### The Problem with Two Step Approach
+When two users hit reserve simultaneously:
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Step 1: Both check stock → both see stock = 1 ✅
+Step 2: Both create reservation → oversell 💀
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Another request can sneak in between the check 
+and the write. This is the race condition.
+
+### Approach 1 — Redis Distributed Lock (Considered)
+Acquire a lock on the product before checking stock.
+Only one request can proceed at a time.
+
+Flow:
+User A acquires lock → checks stock → writes 
+reservation → releases lock
+User B waits → lock released → checks stock → 
+stock = 0 → gets 409
+
+Downside:
+- Extra Redis infrastructure needed
+- Every request has overhead of hitting Redis first
+- If Redis goes down → reservation system goes down
+
+### Approach 2 — Atomic SQL Update (Chosen)
+Instead of two separate steps, combine check and 
+write into one atomic SQL operation:
+
+UPDATE Stock
+SET reservedUnits = reservedUnits + 1
+WHERE id = X
+AND (totalUnits - reservedUnits) >= 1
+
+Postgres handles this at row level:
+- 1 row updated → reservation created
+- 0 rows updated → no stock available → 409
+
+Two simultaneous requests on same row → Postgres 
+queues them automatically → exactly one wins.
+
+Why chosen over Redis:
+- No extra infrastructure needed
+- No explicit overhead lookup in Redis
+- Postgres handles concurrency natively
+- Simpler code, less things can go wrong
+
+## Database Schema
+
+### Why SQL over NoSQL?
+This problem has three requirements that make 
+SQL the clear choice:
+
+1. Related data — Product → Warehouse → Stock 
+   → Reservation (relational by nature)
+2. Atomic updates — core of race condition fix
+3. Transactions — confirm/release operations 
+   need to be all-or-nothing
+
+Postgres handles all three natively. MongoDB would 
+need extra workarounds for atomic updates.
+
+### Tables
+
+**Product**
+Stores basic product information.
+- id, name, price, description
+
+**Warehouse**
+Stores warehouse information.
+- id, name, location
+
+**Stock**
+Bridge between Product and Warehouse.
+Tracks availability per product per warehouse.
+- id, productId, warehouseId
+- totalUnits → physical stock, only changes 
+  on confirmed purchase
+- reservedUnits → currently held in active 
+  checkouts, default 0
+
+**Reservation**
+Temporary hold created when user enters checkout.
+- id, stockId, quantity
+- status → pending / confirmed / released
+- expiresAt → createdAt + 10 minutes
+- createdAt
+
+### How tables connect
+Product ──┐
+          ├──→ Stock ──→ Reservation
+Warehouse─┘
+
+### Why store reservedUnits instead of counting?
+
+Option A — Count on the fly (rejected):
+SELECT COUNT(*) FROM reservations
+WHERE stockId = X AND status = 'pending'
+
+Problem: Gets slower as reservations table grows.
+On high traffic this query becomes expensive.
+
+Option B — Store reservedUnits directly (chosen):
+SELECT totalUnits - reservedUnits FROM stock
+WHERE id = X
+
+Always a fast single row lookup. No joins. 
+No counting. Trade-off: must keep reservedUnits 
+in sync carefully on every operation.
+
+## Expiry Mechanism
+
+Reservations that aren't confirmed before expiresAt 
+must be automatically released so units return to 
+available stock.
+
+### Three approaches considered:
+
+**1. Lazy Cleanup (Rejected)**
+Check and release expired reservations when stock 
+is requested.
+
+Problem: Cleanup happens inside the user's request.
+If there are many expired reservations, every user 
+request becomes slow. Bad performance on high traffic.
+
+**2. Background Worker (Rejected)**
+A continuous process that keeps checking for 
+expired reservations.
+
+Problem: Vercel runs serverless functions — they 
+spin up on request and spin down after. Background 
+worker dies when the function spins down. Expired 
+reservations never get released.
+
+**3. Cron Job (Chosen)**
+A scheduled job runs every minute:
+
+Find all reservations where:
+- status = pending
+- expiresAt < current time
+
+For each expired reservation:
+- Set status = released
+- Decrease reservedUnits in Stock table
+
+Why chosen:
+- Runs independently of user requests
+- No performance impact on users
+- Works perfectly with Vercel Cron
+- Simple to implement and maintain
