@@ -22,6 +22,13 @@ export async function POST(request: Request){
             where: {productId, warehouseId }
         })
 
+        if (!stock) {
+            return NextResponse.json({
+                error: "Stock record not found",
+                success: false
+            }, {status: 404})
+        }
+
         const reservation = await prisma.reservation.create({
             data:{
                 stockId: stock.id,
