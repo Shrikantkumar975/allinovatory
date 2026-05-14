@@ -20,7 +20,10 @@ export async function GET(){
             }))
         }))
     
-        return NextResponse.json(result)
+        return NextResponse.json({
+            data: result,
+            success: true
+        },{status: 200})
     }catch (error){
         return NextResponse.json({
             error: "Something went wrong",
