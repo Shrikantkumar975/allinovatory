@@ -19,15 +19,11 @@ export async function GET(){
                 availableUnits: s.totalUnits - s.reservedUnits
             }))
         }))
-    
-        return NextResponse.json({
-            data: result,
-            success: true
-        },{status: 200})
+        return NextResponse.json(result)
     }catch (error){
         return NextResponse.json({
             error: "Something went wrong",
-            sucess: false
+            success: false
         },{status: 500});
     }
 }
