@@ -12,9 +12,9 @@ export async function GET(){
                 }
             }
         })
-        const result =products.map(product => ({
+        const result =products.map((product: { stock: any[]; }) => ({
             ...product,
-            stock: product.stock.map(s => ({
+            stock: product.stock.map((s: { totalUnits: number; reservedUnits: number; }) => ({
                 ...s,
                 availableUnits: s.totalUnits - s.reservedUnits
             }))
