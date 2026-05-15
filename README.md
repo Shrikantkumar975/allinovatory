@@ -4,6 +4,31 @@
 Allo is building an inventory management platform for 
 retailers with multi-warehouse and D2C brands.
 
+## How to Run Locally
+
+1. **Clone the repository** and install dependencies:
+   ```bash
+   npm install
+   ```
+
+2. **Environment Variables**: Create a `.env` file in the root with your Supabase (or Postgres) connection strings:
+   ```env
+   DATABASE_URL
+   DIRECT_URL
+   ```
+
+3. **Database Setup**: Push the Prisma schema and seed the database with initial products/warehouses:
+   ```bash
+   npx prisma db push
+   npx prisma db seed
+   ```
+
+4. **Run the Development Server**:
+   ```bash
+   npm run dev
+   ```
+   Open `http://localhost:3000` to view the app.
+
 ## The Problem
 When a customer proceeds to checkout, they may take 
 5-10 minutes to complete the payment (UPI, 3DS flows, 
@@ -54,8 +79,8 @@ availableUnits = totalUnits - reservedUnits
 ### The Problem with Two Step Approach
 When two users hit reserve simultaneously:
 
-Step 1: Both check stock → both see stock = 1 ✅
-Step 2: Both create reservation → oversell 💀
+Step 1: Both check stock → both see stock = 1
+Step 2: Both create reservation → oversell
 
 Another request can sneak in between the check 
 and the write. This is the race condition.
@@ -79,10 +104,12 @@ Downside:
 Instead of two separate steps, combine check and 
 write into one atomic SQL operation:
 
+```sql
 UPDATE Stock
 SET reservedUnits = reservedUnits + 1
 WHERE id = X
 AND (totalUnits - reservedUnits) >= 1
+```
 
 Postgres handles this at row level:
 - 1 row updated → reservation created
@@ -139,9 +166,7 @@ Temporary hold created when user enters checkout.
 - createdAt
 
 ### How tables connect
-Product ──┐
-          ├──→ Stock ──→ Reservation
-Warehouse─┘
+Product + Warehouse → Stock → Reservation
 
 ### Why store reservedUnits instead of counting?
 
